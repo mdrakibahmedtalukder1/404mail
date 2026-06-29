@@ -275,6 +275,9 @@
         let loadedMessages = new Set();
         let consecutiveErrors = 0;
         let currentLoadedMessageData = null; 
+        
+        // NEW: Multi-Provider Fallback Tracker
+        let CURRENT_PROVIDER = 'mailtm'; 
 
         // Storage & Firebase State
         let db, auth, userId, appId;
@@ -351,7 +354,7 @@
             return null;
         }
 
-        // 1. Fetch available domains
+        // 1. Fetch available domains (WITH FALLBACK)
         async function loadDomains() {
             try {
                 let allDomains = [];
@@ -377,6 +380,7 @@
                     if (page > 10) hasMore = false; 
                 }
 
+                CURRENT_PROVIDER = 'mailtm';
                 if (domainSelect) {
                     if (allDomains.length > 0) {
                         domainSelect.innerHTML = allDomains.map(d => `<option value="${d}">${d}</option>`).join('');
@@ -385,43 +389,78 @@
                     }
                 }
             } catch (error) {
-                console.error("Failed to load domains", error);
-                if (domainSelect) {
-                    domainSelect.innerHTML = '<option value="">Network Error</option>';
+                // FALLBACK TO 1SECMAIL IF MAIL.TM IS BLOCKED OR DOWN
+                console.warn("Mail.tm API failed, falling back to 1secmail...", error);
+                CURRENT_PROVIDER = '1secmail';
+                
+                try {
+                    const res = await fetchWithRetry('https://www.1secmail.com/api/v1/?action=getDomainList');
+                    const fallbackDomains = await res.json();
+                    if (domainSelect) {
+                        domainSelect.innerHTML = fallbackDomains.map(d => `<option value="${d}">${d}</option>`).join('');
+                    }
+                } catch (fallbackError) {
+                    if (domainSelect) {
+                        domainSelect.innerHTML = '<option value="">Network Error</option>';
+                    }
                 }
             }
         }
 
-        // 2. Helper to Register and Login to Mail.tm
+        // 2. Helper to Register and Login (WITH FALLBACK)
         async function registerAndLogin(address) {
-            const password = Math.random().toString(36).slice(-10) + "A1!";
-            
-            const regRes = await fetchWithRetry(`${API_BASE}/accounts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ address, password })
-            });
-
-            if (!regRes.ok) {
-                if (regRes.status === 422) throw new Error("Username already taken!");
-                throw new Error("Failed to create account");
+            // IF IN FALLBACK MODE, NO REGISTRATION NEEDED
+            if (CURRENT_PROVIDER === '1secmail') {
+                currentEmail = address;
+                currentToken = '1secmail-token'; // Setup dummy token to indicate active provider for this session
+                consecutiveErrors = 0;
+                currentLoadedMessageData = null;
+                await saveSession(currentEmail, currentToken);
+                return;
             }
 
-            const tokenRes = await fetchWithRetry(`${API_BASE}/token`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ address, password })
-            });
+            try {
+                const password = Math.random().toString(36).slice(-10) + "A1!";
+                
+                const regRes = await fetchWithRetry(`${API_BASE}/accounts`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ address, password })
+                });
 
-            if (!tokenRes.ok) throw new Error("Failed to authenticate");
+                if (!regRes.ok) {
+                    if (regRes.status === 422) throw new Error("Username already taken!");
+                    throw new Error("Failed to create account");
+                }
 
-            const tokenData = await tokenRes.json();
-            currentToken = tokenData.token;
-            currentEmail = address;
-            consecutiveErrors = 0;
-            currentLoadedMessageData = null;
+                const tokenRes = await fetchWithRetry(`${API_BASE}/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ address, password })
+                });
 
-            await saveSession(currentEmail, currentToken);
+                if (!tokenRes.ok) throw new Error("Failed to authenticate");
+
+                const tokenData = await tokenRes.json();
+                currentToken = tokenData.token;
+                currentEmail = address;
+                consecutiveErrors = 0;
+                currentLoadedMessageData = null;
+
+                await saveSession(currentEmail, currentToken);
+            } catch (error) {
+                // If it's a legitimate error like "username taken", throw it back to the UI
+                if (error.message === "Username already taken!") throw error;
+                
+                // IF NETWORK/API FAILS DURING GENERATION, HOT-SWAP TO 1SECMAIL
+                console.warn("Mail.tm registration failed, falling back to 1secmail...", error);
+                CURRENT_PROVIDER = '1secmail';
+                currentEmail = address;
+                currentToken = '1secmail-token';
+                consecutiveErrors = 0;
+                currentLoadedMessageData = null;
+                await saveSession(currentEmail, currentToken);
+            }
         }
 
         // 3. UI Reset Helper
@@ -520,19 +559,38 @@
             }
         }
 
-        // 6. Check Inbox
+        // 6. Check Inbox (WITH FALLBACK ROUTING)
         async function checkInbox() {
             if (!currentToken) return;
 
             try {
-                const res = await fetchWithRetry(`${API_BASE}/messages`, {
-                    headers: { 'Authorization': `Bearer ${currentToken}` }
-                });
-                
-                if (!res.ok) throw new Error("Auth error");
-                
-                const data = await res.json();
-                const messages = data['hydra:member'];
+                let messages = [];
+                const is1secmail = currentToken === '1secmail-token';
+
+                if (is1secmail) {
+                    const [login, domain] = currentEmail.split('@');
+                    const res = await fetchWithRetry(`https://www.1secmail.com/api/v1/?action=getMessages&login=${login}&domain=${domain}`);
+                    if (!res.ok) throw new Error("1secmail Auth error");
+                    
+                    const data = await res.json();
+                    
+                    // Map 1secmail format to our UI format so nothing breaks visually
+                    messages = data.map(msg => ({
+                        id: msg.id,
+                        from: { address: msg.from, name: '' },
+                        subject: msg.subject,
+                        createdAt: msg.date
+                    }));
+                } else {
+                    const res = await fetchWithRetry(`${API_BASE}/messages`, {
+                        headers: { 'Authorization': `Bearer ${currentToken}` }
+                    });
+                    
+                    if (!res.ok) throw new Error("Auth error");
+                    const data = await res.json();
+                    messages = data['hydra:member'];
+                }
+
                 consecutiveErrors = 0;
 
                 if(messageCount) messageCount.innerText = messages.length;
@@ -582,7 +640,7 @@
             }
         }
 
-        // 7. Read Specific Message
+        // 7. Read Specific Message (WITH FALLBACK ROUTING)
         async function readMessage(messageId, listItemElement) {
             try {
                 document.querySelectorAll('#messageList li').forEach(el => {
@@ -596,17 +654,40 @@
                 if(messageViewer) {
                     messageViewer.innerHTML = `<div class="text-center text-indigo-500 flex flex-col items-center"><svg class="w-10 h-10 animate-spin mb-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> <span class="animate-pulse font-bold text-lg">Decrypting payload...</span></div>`;
                     
-                    // Auto-scroll to the reader on mobile devices
                     if (window.innerWidth < 768) {
                         const readerContainer = document.getElementById('readerContainer') || messageViewer;
                         readerContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
                     }
                 }
 
-                const res = await fetchWithRetry(`${API_BASE}/messages/${messageId}`, {
-                    headers: { 'Authorization': `Bearer ${currentToken}` }
-                });
-                const msg = await res.json();
+                let msg;
+                const is1secmail = currentToken === '1secmail-token';
+
+                if (is1secmail) {
+                    const [login, domain] = currentEmail.split('@');
+                    const res = await fetchWithRetry(`https://www.1secmail.com/api/v1/?action=readMessage&login=${login}&domain=${domain}&id=${messageId}`);
+                    const data = await res.json();
+                    
+                    msg = {
+                        id: data.id,
+                        subject: data.subject,
+                        from: { address: data.from, name: '' },
+                        createdAt: data.date,
+                        html: data.htmlBody ? [data.htmlBody] : [],
+                        text: data.textBody,
+                        // Mapped attachments perfectly for the UI format
+                        attachments: (data.attachments || []).map(a => ({
+                            id: a.filename, // 1secmail expects filename for downloads
+                            filename: a.filename,
+                            size: a.size
+                        }))
+                    };
+                } else {
+                    const res = await fetchWithRetry(`${API_BASE}/messages/${messageId}`, {
+                        headers: { 'Authorization': `Bearer ${currentToken}` }
+                    });
+                    msg = await res.json();
+                }
                 
                 currentLoadedMessageData = msg;
 
@@ -617,7 +698,7 @@
                     content = `<pre class="whitespace-pre-wrap font-sans text-sm">${msg.text}</pre>`;
                 }
 
-                // NEW: Process and render attachments if they exist
+                // Process and render attachments
                 let attachmentsHtml = '';
                 if (msg.attachments && msg.attachments.length > 0) {
                     attachmentsHtml = `
@@ -691,23 +772,31 @@
             }
         }
 
-        // NEW: Download Specific Attachment securely via API
+        // NEW: Download Specific Attachment securely via API (WITH FALLBACK ROUTING)
         async function downloadAttachment(messageId, attachmentId, filename, btnElement) {
             if (!currentToken) return;
             
-            // Show spinning loading icon on the download button
             const originalHtml = btnElement.innerHTML;
             btnElement.innerHTML = `<svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
             btnElement.disabled = true;
 
             try {
-                const res = await fetchWithRetry(`${API_BASE}/messages/${messageId}/attachment/${attachmentId}`, {
-                    headers: { 'Authorization': `Bearer ${currentToken}` }
-                });
+                const is1secmail = currentToken === '1secmail-token';
+                let blob;
+
+                if (is1secmail) {
+                    const [login, domain] = currentEmail.split('@');
+                    const res = await fetchWithRetry(`https://www.1secmail.com/api/v1/?action=download&login=${login}&domain=${domain}&id=${messageId}&file=${attachmentId}`);
+                    if (!res.ok) throw new Error("Failed to download attachment");
+                    blob = await res.blob();
+                } else {
+                    const res = await fetchWithRetry(`${API_BASE}/messages/${messageId}/attachment/${attachmentId}`, {
+                        headers: { 'Authorization': `Bearer ${currentToken}` }
+                    });
+                    if (!res.ok) throw new Error("Failed to download attachment");
+                    blob = await res.blob();
+                }
                 
-                if (!res.ok) throw new Error("Failed to download attachment");
-                
-                const blob = await res.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
                 a.href = url;
@@ -721,7 +810,6 @@
                 console.error("Attachment download error:", error);
                 alert("Failed to download attachment. Please try again.");
             } finally {
-                // Restore original download icon
                 btnElement.innerHTML = originalHtml;
                 btnElement.disabled = false;
             }
@@ -752,7 +840,7 @@
             URL.revokeObjectURL(url);
         }
 
-        // 9. Delete Message
+        // 9. Delete Message (WITH FALLBACK ROUTING)
         async function deleteEmail(id) {
             if (!currentToken) return;
             
@@ -760,10 +848,17 @@
             if(viewer) viewer.innerHTML = `<div class="text-center text-red-500 flex flex-col items-center"><svg class="w-10 h-10 animate-spin mb-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> <span class="animate-pulse font-bold text-lg">Deleting securely...</span></div>`;
 
             try {
-                await fetchWithRetry(`${API_BASE}/messages/${id}`, {
-                    method: 'DELETE',
-                    headers: { 'Authorization': `Bearer ${currentToken}` }
-                });
+                const is1secmail = currentToken === '1secmail-token';
+
+                if (is1secmail) {
+                    // 1secmail does not support API-level deletions, so we just simulate removal visually
+                    await new Promise(r => setTimeout(r, 400)); 
+                } else {
+                    await fetchWithRetry(`${API_BASE}/messages/${id}`, {
+                        method: 'DELETE',
+                        headers: { 'Authorization': `Bearer ${currentToken}` }
+                    });
+                }
                 
                 // Immediately remove only this email from tracking
                 loadedMessages.delete(id); 
@@ -900,10 +995,10 @@
         window.manualRefresh = manualRefresh;
         window.toggleWorkspace = toggleWorkspace;
         window.generateNumber = generateNumber;
-        window.downloadAttachment = downloadAttachment; // Expose the new attachment downloader
+        window.downloadAttachment = downloadAttachment;
 
         async function initializeAppFlow() {
-            await loadDomains();
+            await loadDomains(); // Will seamlessly set the active provider and domains
             
             if (isCloudStorageEnabled) {
                 if (typeof __initial_auth_token !== 'undefined') {
